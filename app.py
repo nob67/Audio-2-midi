@@ -25,18 +25,18 @@ def mp3_to_midi(audio_file, threshold=0.1, hop_length=512):
         y, sr = librosa.load(audio_file, sr=None)
         
         # Compute constant-Q transform for pitch detection
-        cqt = librosa.cqt(y, sr=sr, hop_length=hop_length)
+        fmin = librosa.note_to_hz('C1')
+        n_bins = 84
+        bins_per_octave = 12
+        
+        cqt = librosa.cqt(y, sr=sr, hop_length=hop_length, fmin=fmin, n_bins=n_bins, bins_per_octave=bins_per_octave)
         cqt_magnitude = np.abs(cqt)
         
         # Get the note with maximum magnitude at each time step
         notes = np.argmax(cqt_magnitude, axis=0)
         
-        # Convert to frequency
-        frequencies = librosa.cq_frequencies(
-            n_bins=cqt_magnitude.shape[0],
-            fmin=librosa.note_to_hz('C1'),
-            bins_per_octave=12
-        )
+        # Compute frequencies for each CQT bin
+        frequencies = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin, bins_per_octave=bins_per_octave)
         
         # Get magnitude values
         note_magnitudes = cqt_magnitude[notes, np.arange(len(notes))]
