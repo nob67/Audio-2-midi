@@ -133,8 +133,7 @@ def create_interface():
                 gr.Markdown("### Input")
                 audio_input = gr.Audio(
                     label="Upload MP3 File",
-                    type="filepath",
-                    formats=["mp3"]
+                    type="filepath"
                 )
                 
                 threshold = gr.Slider(
