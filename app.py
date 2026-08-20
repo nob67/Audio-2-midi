@@ -1,193 +1,179 @@
-import gradio as gr
-import librosa
-import numpy as np
-from scipy import signal
-import mido
-from mido import MidiFile, MidiTrack, Message
-import tempfile
 import os
+import zipfile
+import tempfile
+import gradio as gr
+import pandas as pd
+from PIL import Image
+from imposition import calculate_imposition
+from exporter import export_to_pdf, export_to_pptx
 
 
-def mp3_to_midi(audio_file, threshold=0.1, hop_length=512):
+def process_uploaded_files(files_or_zip):
     """
-    Convert MP3 audio to MIDI file.
-    
-    Args:
-        audio_file: Path to MP3 file
-        threshold: Confidence threshold for note detection (0-1)
-        hop_length: Number of samples between successive frames
-    
-    Returns:
-        Path to generated MIDI file
+    Extracts or collects image file paths from uploaded file(s) or ZIP archive.
+    Includes path traversal checks for ZIP extraction safety.
     """
-    try:
-        # Load audio file
-        y, sr = librosa.load(audio_file, sr=None)
-        
-        # Compute constant-Q transform for pitch detection
-        fmin = librosa.note_to_hz('C1')
-        n_bins = 84
-        bins_per_octave = 12
-        
-        cqt = librosa.cqt(y, sr=sr, hop_length=hop_length, fmin=fmin, n_bins=n_bins, bins_per_octave=bins_per_octave)
-        cqt_magnitude = np.abs(cqt)
-        
-        # Get the note with maximum magnitude at each time step
-        notes = np.argmax(cqt_magnitude, axis=0)
-        
-        # Compute frequencies for each CQT bin
-        frequencies = librosa.cqt_frequencies(n_bins=n_bins, fmin=fmin, bins_per_octave=bins_per_octave)
-        
-        # Get magnitude values
-        note_magnitudes = cqt_magnitude[notes, np.arange(len(notes))]
-        
-        # Normalize magnitudes
-        max_magnitude = np.max(note_magnitudes)
-        normalized_magnitudes = note_magnitudes / max_magnitude if max_magnitude > 0 else note_magnitudes
-        
-        # Apply threshold
-        active_notes = normalized_magnitudes > threshold
-        
-        # Create MIDI file
-        mid = MidiFile()
-        track = MidiTrack()
-        mid.tracks.append(track)
-        
-        # Set tempo (microseconds per beat)
-        tempo = mido.bpm2tempo(120)
-        track.append(Message('program_change', program=0, time=0))
-        
-        # Calculate time per frame in ticks
-        time_per_frame = int((60 * 1000000 / tempo) / (sr / hop_length) * 1000)
-        
-        current_note = None
-        note_start = 0
-        
-        for i in range(len(notes)):
-            freq = frequencies[notes[i]]
-            
-            # Convert frequency to MIDI note number
-            midi_note = librosa.hz_to_midi(freq)
-            midi_note = int(round(midi_note))
-            
-            # Clamp to valid MIDI range
-            midi_note = max(0, min(127, midi_note))
-            
-            if active_notes[i]:
-                if current_note is None or current_note != midi_note:
-                    # Note changed or new note started
-                    if current_note is not None:
-                        # End previous note
-                        duration = max(1, (i - note_start) * time_per_frame)
-                        track.append(Message('note_off', note=current_note, velocity=80, time=duration))
-                    
-                    # Start new note
-                    track.append(Message('note_on', note=midi_note, velocity=100, time=0))
-                    current_note = midi_note
-                    note_start = i
-            else:
-                if current_note is not None:
-                    # End current note
-                    duration = max(1, (i - note_start) * time_per_frame)
-                    track.append(Message('note_off', note=current_note, velocity=80, time=duration))
-                    current_note = None
-        
-        # End any remaining note
-        if current_note is not None:
-            duration = max(1, (len(notes) - note_start) * time_per_frame)
-            track.append(Message('note_off', note=current_note, velocity=80, time=duration))
-        
-        # Save MIDI file
-        output_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mid')
-        output_path = output_file.name
-        output_file.close()
-        
-        mid.save(output_path)
-        
-        return output_path, "✓ Conversion successful!"
+    if not files_or_zip:
+        return []
+
+    extracted_paths = []
     
-    except Exception as e:
-        return None, f"✗ Error: {str(e)}"
+    # Handle single or multiple inputs from Gradio
+    file_list = files_or_zip if isinstance(files_or_zip, list) else [files_or_zip]
+    
+    for f in file_list:
+        file_path = f.name if hasattr(f, 'name') else str(f)
+        if file_path.lower().endswith('.zip'):
+            temp_dir = tempfile.mkdtemp(prefix="book_imgs_")
+            try:
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    # Prevent Zip Slip / directory traversal
+                    real_temp_dir = os.path.realpath(temp_dir)
+                    for member in zip_ref.infolist():
+                        target_path = os.path.realpath(os.path.join(temp_dir, member.filename))
+                        if not target_path.startswith(real_temp_dir + os.sep) and target_path != real_temp_dir:
+                            raise ValueError(f"Illegal path in ZIP archive: {member.filename}")
+                        zip_ref.extract(member, temp_dir)
+
+                    for root, _, filenames in os.walk(temp_dir):
+                        for fname in sorted(filenames):
+                            if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff')):
+                                extracted_paths.append(os.path.join(root, fname))
+            except Exception as e:
+                print(f"Error reading ZIP file: {e}")
+        else:
+            if file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff')):
+                extracted_paths.append(file_path)
+
+    return sorted(extracted_paths)
+
+
+def update_layout_preview(files, rows, cols, rotate_back):
+    """
+    Computes layout and returns a summary Markdown and DataFrame for preview.
+    """
+    image_paths = process_uploaded_files(files)
+    total_images = len(image_paths)
+
+    layout_data = calculate_imposition(image_paths if total_images > 0 else 0, rows=int(rows), cols=int(cols), rotate_back=rotate_back)
+
+    summary = (
+        f"**Total Images:** {layout_data['total_images']} | "
+        f"**Grid Size:** {layout_data['rows']}×{layout_data['cols']} ({layout_data['images_per_side']} per side) | "
+        f"**Total Physical Sheets:** {layout_data['total_sheets']} | "
+        f"**Total Logical Page Sides:** {layout_data['total_logical_pages']}"
+    )
+
+    table_rows = []
+    for sheet in layout_data['sheets']:
+        s_num = sheet['sheet_number']
+        
+        # Front side summary
+        front_items = sheet['front']['items']
+        front_names = [os.path.basename(p) if isinstance(p, str) else ("Empty" if p is None else str(p)) for p in front_items]
+        table_rows.append({
+            "Sheet": s_num,
+            "Side": "Front",
+            "Logical Pages": sheet['front']['logical_page_number'],
+            "Rotated 180°": sheet['front']['rotate_180'],
+            "Grid Images": ", ".join(front_names)
+        })
+        
+        # Back side summary
+        back_items = sheet['back']['items']
+        back_names = [os.path.basename(p) if isinstance(p, str) else ("Empty" if p is None else str(p)) for p in back_items]
+        table_rows.append({
+            "Sheet": s_num,
+            "Side": "Back",
+            "Logical Pages": sheet['back']['logical_page_number'],
+            "Rotated 180°": sheet['back']['rotate_180'],
+            "Grid Images": ", ".join(back_names)
+        })
+        
+    df = pd.DataFrame(table_rows) if table_rows else pd.DataFrame(columns=["Sheet", "Side", "Logical Pages", "Rotated 180°", "Grid Images"])
+    return summary, df
+
+
+def generate_export_pdf(files, rows, cols, rotate_back):
+    image_paths = process_uploaded_files(files)
+    if not image_paths:
+        return None, "✗ Please upload image files or a ZIP archive first."
+    
+    layout_data = calculate_imposition(image_paths, rows=int(rows), cols=int(cols), rotate_back=rotate_back)
+    out_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
+    export_to_pdf(layout_data, out_pdf)
+    return out_pdf, "✓ PDF Export generated successfully!"
+
+
+def generate_export_pptx(files, rows, cols, rotate_back):
+    image_paths = process_uploaded_files(files)
+    if not image_paths:
+        return None, "✗ Please upload image files or a ZIP archive first."
+    
+    layout_data = calculate_imposition(image_paths, rows=int(rows), cols=int(cols), rotate_back=rotate_back)
+    out_pptx = tempfile.NamedTemporaryFile(delete=False, suffix=".pptx").name
+    export_to_pptx(layout_data, out_pptx)
+    return out_pptx, "✓ PPTX Export generated successfully!"
 
 
 def create_interface():
-    """Create and launch the Gradio interface"""
-    
-    with gr.Blocks(title="MP3 to MIDI Converter") as demo:
+    with gr.Blocks(title="Book Pagination and Layout Application") as demo:
         gr.Markdown(
             """
-            # 🎵 MP3 to MIDI Converter
+            # 📖 Book Pagination & Imposition Application
             
-            Convert your MP3 audio files to MIDI format using pitch detection.
-            
-            **How it works:**
-            1. Upload an MP3 file
-            2. Adjust the sensitivity threshold (lower = more notes detected)
-            3. Click Convert
-            4. Download the generated MIDI file
+            Upload images, configure imposition layout and grid parameters, and export print-ready PDF or PPTX files.
             """
         )
         
         with gr.Row():
-            with gr.Column():
-                gr.Markdown("### Input")
-                audio_input = gr.Audio(
-                    label="Upload MP3 File",
-                    type="filepath"
+            with gr.Column(scale=1):
+                gr.Markdown("### 1. Upload Images")
+                file_input = gr.File(
+                    label="Upload Image Files or ZIP Archive",
+                    file_count="multiple",
+                    file_types=["image", ".zip"]
                 )
                 
-                threshold = gr.Slider(
-                    minimum=0.01,
-                    maximum=0.5,
-                    value=0.1,
-                    step=0.01,
-                    label="Detection Threshold",
-                    info="Lower values detect quieter notes (more sensitive)"
-                )
+                gr.Markdown("### 2. Layout & Imposition Configuration")
+                rows_input = gr.Slider(minimum=1, maximum=10, value=2, step=1, label="Rows per Side")
+                cols_input = gr.Slider(minimum=1, maximum=10, value=2, step=1, label="Columns per Side")
+                rotate_back_input = gr.Checkbox(value=False, label="Rotate Back Side 180° (Duplex / Tumble Binding)")
                 
-                convert_btn = gr.Button("🎹 Convert to MIDI", variant="primary", scale=2)
-            
-            with gr.Column():
-                gr.Markdown("### Output")
-                status_text = gr.Textbox(
-                    label="Status",
-                    interactive=False,
-                    lines=1
-                )
+                calculate_btn = gr.Button("🔄 Calculate Imposition", variant="primary")
                 
-                midi_output = gr.File(
-                    label="Download MIDI File",
-                    interactive=False
-                )
-        
-        gr.Markdown(
-            """
-            ### Tips for Best Results
-            - **Clear audio**: Use high-quality recordings for better pitch detection
-            - **Single instrument**: Works best with monophonic (single-note) audio
-            - **Adjust sensitivity**: If you're getting too many notes, increase threshold
-            - **Clean recordings**: Minimize background noise for accurate conversion
-            """
+            with gr.Column(scale=2):
+                gr.Markdown("### 3. Imposition Plan Preview")
+                summary_output = gr.Markdown("Upload images and click **Calculate Imposition** to view the layout plan.")
+                table_output = gr.Dataframe(label="Sheet & Page Allocation Table", interactive=False)
+
+                gr.Markdown("### 4. Export")
+                with gr.Row():
+                    pdf_btn = gr.Button("📄 Export PDF", variant="secondary")
+                    pptx_btn = gr.Button("📊 Export PPTX", variant="secondary")
+
+                status_output = gr.Textbox(label="Status", interactive=False)
+                file_download = gr.File(label="Download File", interactive=False)
+
+        # Event bindings
+        calculate_btn.click(
+            fn=update_layout_preview,
+            inputs=[file_input, rows_input, cols_input, rotate_back_input],
+            outputs=[summary_output, table_output]
         )
         
-        # Handle conversion
-        def convert(audio_file, threshold_val):
-            if audio_file is None:
-                return None, "✗ Please upload an MP3 file"
-            
-            midi_path, status = mp3_to_midi(audio_file, threshold=threshold_val)
-            
-            if midi_path and os.path.exists(midi_path):
-                return midi_path, status
-            else:
-                return None, status
-        
-        convert_btn.click(
-            fn=convert,
-            inputs=[audio_input, threshold],
-            outputs=[midi_output, status_text]
+        pdf_btn.click(
+            fn=generate_export_pdf,
+            inputs=[file_input, rows_input, cols_input, rotate_back_input],
+            outputs=[file_download, status_output]
         )
-    
+        
+        pptx_btn.click(
+            fn=generate_export_pptx,
+            inputs=[file_input, rows_input, cols_input, rotate_back_input],
+            outputs=[file_download, status_output]
+        )
+
     return demo
 
 
